@@ -1,0 +1,21 @@
+{
+  "_comment": "Copy this file to 'config.json' (next to the tool) to override the built-in defaults WITHOUT recompiling. Any key you include wins; any key you omit keeps the built-in default; if config.json is missing or invalid, the built-in TEST defaults are used. The active source is shown in the window log on every run ('Config: ...').",
+
+  "_TemplateSheetId": "Stable id of the 'Tekla Import Template' sheet that gets copied for each release.",
+  "TemplateSheetId": 2860137659191172,
+
+  "_DestinationId": "The PARENT container that holds the Job # folders. NOT a Job folder itself. In TEST this is the 'QMI Expediting' FOLDER (id 4375630767777668), inside the 'Test Files' workspace (id 2497329237387140).",
+  "DestinationId": 4375630767777668,
+
+  "_DestinationType": "'workspace' if DestinationId is a workspace, 'folder' if it is a folder. TEST = 'folder' (QMI Expediting is a folder).",
+  "DestinationType": "folder",
+
+  "EnvironmentName": "TEST",
+
+  "_production_example": {
+    "TemplateSheetId": "<prod template sheet id>",
+    "DestinationId": "<prod parent (workspace/folder) id that holds the Job # folders>",
+    "DestinationType": "folder",
+    "EnvironmentName": "PRODUCTION"
+  }
+}
