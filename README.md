@@ -22,8 +22,8 @@ in the sample project for the shared patterns and Smartsheet gotchas.
 2. **`Main Piece` is a CHECKBOX.** The Tekla CSV emits `1`/`0` and the Excel export
    emits `TRUE`/`FALSE`; both are normalized to a real JSON **boolean** (`true`/`false`),
    which is exactly how a checkbox cell is stored (verified against an existing release
-   sheet). A `Weight Each` transform also strips the trailing `#` the CSV adds
-   (`14.802083#` → `14.802083`; the `.xlsx` already exports a clean number).
+   sheet). A `Weight Each` transform also strips the trailing `#` and thousands
+   comma the export's display format adds (`1,966.93#` → `1966.93`).
 3. **Seq and Release are columns in the Tekla file**, so the GUI collects only the
    **Job #**. `Seq`/`Rel` for each sheet name are read from the file, and the
    `Sequence(s)`/`Release(s)` summary fields are formulas that derive themselves from
