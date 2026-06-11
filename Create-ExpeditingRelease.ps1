@@ -62,11 +62,11 @@ $TemplateSheetName = "Tekla Import Template"   # for the run log / sanity only
 
 # The PARENT container that holds the Job # folders. This is NOT a Job folder
 # itself - the tool finds/creates the "<Job>" folder inside it and copies each
-# release sheet there. In TEST this is the "QMI Expediting" FOLDER, which lives
-# inside the "Test Files" workspace (id 2497329237387140) and holds the Job
-# folders (e.g. "26-10") plus the "Template" folder.
-$DestinationId   = 4375630767777668   # "QMI Expediting" folder
-$DestinationType = "folder"           # "workspace" | "folder"
+# release sheet there. The Job folders (e.g. "26-10") now live DIRECTLY in the
+# "QMI Expediting" WORKSPACE (there is no longer an intermediate "QMI
+# Expediting" folder).
+$DestinationId   = 2497329237387140   # "QMI Expediting" workspace
+$DestinationType = "workspace"        # "workspace" | "folder"
 
 # Shown in the window title + run log so a TEST build is never mistaken for PRODUCTION.
 $EnvironmentName = "TEST"
@@ -91,7 +91,7 @@ if (Test-Path $ConfigPath) {
 }
 
 # Tool version - shown in the window title and run log. Bump on each released change.
-$ScriptVersion = "1.2.2"
+$ScriptVersion = "1.2.3"
 
 # Sheet-SUMMARY field on the copied sheet to stamp with the Job #. (Sequence(s)
 # and Release(s) are FORMULA summary fields that derive themselves from the
