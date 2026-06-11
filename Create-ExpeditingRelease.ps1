@@ -28,8 +28,8 @@
       Tekla CSV emits 1/0 and the Excel export emits TRUE/FALSE; both are
       normalized to a real JSON boolean (true/false) - that is exactly how a
       checkbox cell is stored (verified against an existing release sheet).
-      (A "Weight Each" transform also strips the trailing "#" the CSV adds,
-       e.g. "14.802083#" -> 14.802083; the .xlsx already exports a clean number.)
+      (A "Weight Each" transform also strips the trailing "#" and thousands
+       comma the export's display format adds, e.g. "1,966.93#" -> 1966.93.)
    3. Seq and Release are COLUMNS inside the Tekla file, so the GUI collects
       only the Job #. Seq/Rel for the sheet name are derived from the file.
    Architecturally: we copy a single SHEET (the release artifact here is one
@@ -91,7 +91,7 @@ if (Test-Path $ConfigPath) {
 }
 
 # Tool version - shown in the window title and run log. Bump on each released change.
-$ScriptVersion = "1.2.0"
+$ScriptVersion = "1.2.1"
 
 # Sheet-SUMMARY field on the copied sheet to stamp with the Job #. (Sequence(s)
 # and Release(s) are FORMULA summary fields that derive themselves from the
@@ -204,10 +204,11 @@ $TeklaValueTransforms = @{
         elseif ($t -eq '0' -or $t -eq 'FALSE' -or $t -eq 'N' -or $t -eq 'NO')  { $false }
         else   { $v }
     }
-    # The Tekla CSV appends "#" to weight fields (e.g. "14.802083#"); strip it so
-    # the value lands as a number. (The .xlsx already exports a clean number, so
-    # this is a no-op there.)
-    "Weight Each" = { param($v) (([string]$v) -replace '#', '').Trim() }
+    # Weight cells arrive as DISPLAY text: the export's number format appends "#"
+    # and adds a thousands comma at >= 1,000 (e.g. "1,966.93#"; the Excel-COM
+    # xlsx->csv conversion writes the formatted text, and the Tekla CSV emits the
+    # same format). Strip both so the value lands as a number.
+    "Weight Each" = { param($v) (([string]$v) -replace '[#,]', '').Trim() }
 }
 # =============================================================================
 
@@ -844,11 +845,12 @@ function Assert-SeqRelPresent {
     }
 }
 
-# Parse a Tekla weight cell to a number. The CSV variant appends "#"; strip it.
-# Returns $null if the cell is blank or not numeric.
+# Parse a Tekla weight cell to a number. Weight cells arrive as DISPLAY text -
+# trailing "#" plus a thousands comma at >= 1,000 (e.g. "1,966.93#") - strip
+# both. Returns $null if the cell is blank or not numeric.
 function ConvertTo-WeightNumber {
     param($Value)
-    $s = (([string]$Value) -replace '#', '').Trim()
+    $s = (([string]$Value) -replace '[#,]', '').Trim()
     if ($s -eq '') { return $null }
     $d = 0.0
     $ok = [double]::TryParse($s, [System.Globalization.NumberStyles]::Float,
@@ -896,7 +898,10 @@ function Assert-QtyAndWeight {
         }
         $sumEach  += ($qty * $each)
         $sumTotal += $total
-        $tol = [math]::Max(0.05, [math]::Abs($total) * 0.001)
+        # Both weights are DISPLAY values rounded to 2 decimals, so Qty x each can
+        # legitimately drift from the stated total by up to ~0.005 per piece (plus
+        # 0.005 on the total itself) - the tolerance must scale with Qty.
+        $tol = [math]::Max([math]::Max(0.05, 0.006 * ($qty + 1)), [math]::Abs($total) * 0.001)
         if ([math]::Abs(($qty * $each) - $total) -gt $tol) {
             $nBadWt++
             if ($badWt.Count -lt 5) { [void]$badWt.Add(("file row {0}: Qty {1} x {2} = {3:0.###} but '{4}' says {5:0.###}" -f $fileRow, $qty, $each, ($qty * $each), $TotalWeightHeader, $total)) }
@@ -910,7 +915,9 @@ function Assert-QtyAndWeight {
         throw "$nBadWt of $($rows.Count) data row(s) FAILED the weight cross-check (Qty x '$WeightEachHeader' should equal '$TotalWeightHeader'). First mismatches: $($badWt -join '; '). The export looks inconsistent - re-export from Tekla and re-run. Nothing was created in Smartsheet."
     }
     if ($hasTotal) {
-        & $Log ("  Weight check OK: Qty x each = {0:0.##} matches stated totals = {1:0.##} on all {2} row(s)." -f $sumEach, $sumTotal, $rows.Count)
+        # The two sums differ slightly because the file carries 2-decimal display
+        # values; per-row agreement (within tolerance) is what was enforced above.
+        & $Log ("  Weight check OK on all {0} row(s): file total Qty x each = {1:0.##}; stated totals = {2:0.##}." -f $rows.Count, $sumEach, $sumTotal)
     }
 }
 
