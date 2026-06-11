@@ -91,14 +91,15 @@ releases. The tool now defends against it in three layers:
 
 ## Configure
 
-The **TEST** environment is prefilled and ready to run — everything currently lives in
-the **Test Files** workspace (id `2497329237387140`):
+The defaults are prefilled and ready to run — the `26-10`-style Job folders live
+**directly in the QMI Expediting workspace** (there is no intermediate "QMI
+Expediting" folder anymore):
 
-| Setting | TEST value | Meaning |
+| Setting | Value | Meaning |
 |---|---|---|
 | `TemplateSheetId` | `2860137659191172` | the `Tekla Import Template` sheet that gets copied |
-| `DestinationId` | `4375630767777668` | the **QMI Expediting** folder (holds the `26-10`-style Job folders) |
-| `DestinationType` | `"folder"` | QMI Expediting is a folder inside the workspace |
+| `DestinationId` | `2497329237387140` | the **QMI Expediting** workspace (holds the `26-10`-style Job folders) |
+| `DestinationType` | `"workspace"` | the destination is a workspace, not a folder |
 | `EnvironmentName` | `"TEST"` | shown in the title bar + log |
 
 To move to **production** (or fix an id) without recompiling, copy
