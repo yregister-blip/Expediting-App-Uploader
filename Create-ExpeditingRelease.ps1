@@ -10,7 +10,12 @@
      2. Renames the copy  "<Job> Seq <Seq> Rel <Rel>"  (Seq/Rel are read FROM
         the Tekla file, not typed - they live in the export).
      3. Wipes the copy and loads the dropped Tekla file (CSV or .xls/.xlsx;
-        Excel files are read via Excel COM).
+        Excel files are read via Excel COM). Each source row is EXPLODED into
+        one row PER PIECE (a row with Qty 4 becomes 4 rows), each stamped with
+        an "Instance" number so every physical piece of a Main Mk + Piece Mk
+        combination is uniquely identifiable. The per-piece "Weight Each" is
+        what lands in the sheet's Weight column; the file's TOTAL Weight column
+        is used only to cross-check Qty x Weight Each before anything uploads.
      4. Stamps the "Job #" sheet-summary field (Sequence(s)/Release(s) are
         formula summary fields that derive themselves from the loaded rows).
      5. VERIFIES every intended row actually landed; if not, the run fails
@@ -23,8 +28,8 @@
       Tekla CSV emits 1/0 and the Excel export emits TRUE/FALSE; both are
       normalized to a real JSON boolean (true/false) - that is exactly how a
       checkbox cell is stored (verified against an existing release sheet).
-      (A "Weight" transform also strips the trailing "#" the CSV adds, e.g.
-       "14.802083#" -> 14.802083; the .xlsx already exports a clean number.)
+      (A "Weight Each" transform also strips the trailing "#" the CSV adds,
+       e.g. "14.802083#" -> 14.802083; the .xlsx already exports a clean number.)
    3. Seq and Release are COLUMNS inside the Tekla file, so the GUI collects
       only the Job #. Seq/Rel for the sheet name are derived from the file.
    Architecturally: we copy a single SHEET (the release artifact here is one
@@ -86,7 +91,7 @@ if (Test-Path $ConfigPath) {
 }
 
 # Tool version - shown in the window title and run log. Bump on each released change.
-$ScriptVersion = "1.0.0"
+$ScriptVersion = "1.2.0"
 
 # Sheet-SUMMARY field on the copied sheet to stamp with the Job #. (Sequence(s)
 # and Release(s) are FORMULA summary fields that derive themselves from the
@@ -128,13 +133,27 @@ try {
 $IncompleteSuffix = "  !! INCOMPLETE - DO NOT USE !!"
 $DryRunSuffix     = "  (DRY RUN - no data loaded)"
 
+# Release-level auto-retry. A Smartsheet sheet COPY is eventually consistent: a
+# freshly-copied sheet can briefly return 404 ("Not Found") on a follow-up call
+# even though it exists (it answers the next call fine). The per-call layer
+# (Invoke-SS + Wait-SheetReady) absorbs most of that; this is the safety net for
+# any release that still fails - the whole Seq/Rel group is re-attempted from a
+# clean slate up to this many extra times, after a short settle.
+$MaxReleaseRetries  = 2
+$RetrySettleSeconds = 8
+
 # ----------------------------- COLUMN MAPPINGS -------------------------------
 # Map by HEADER NAME in the Tekla file -> Smartsheet column TITLE. Only columns
 # listed here are written; everything else is left for Smartsheet to compute.
 # Blank source values are skipped. Titles resolve to live column ids at runtime
 # (a copied sheet gets fresh column ids - see Resolve-ColumnMap).
 #
-# In this export the file headers match the Smartsheet column titles 1:1.
+# PER-PIECE LOADING (v1.2): the file's "Qty" column is NOT uploaded. Instead
+# each source row is exploded into Qty rows, and a synthetic "Instance" value
+# (1,2,3... per Main Mk + Piece Mk combination) is written to the Smartsheet
+# "Instance" column (the renamed Qty column). The per-piece "Weight Each" from
+# the file lands in the Smartsheet "Weight" column; the file's TOTAL "Weight"
+# column is validation-only and is never uploaded (see Assert-QtyAndWeight).
 $TeklaColumnMap = @{
     "Seq"          = "Seq"
     "Release #"    = "Release #"
@@ -145,9 +164,9 @@ $TeklaColumnMap = @{
     "Shape"        = "Shape"
     "Dimension"    = "Dimension"
     "Grade"        = "Grade"
-    "Qty"          = "Qty"
+    "Instance"     = "Instance"
     "Length"       = "Length"
-    "Weight"       = "Weight"
+    "Weight Each"  = "Weight"
     "Pay Category" = "Pay Category"
     "Remarks"      = "Remarks"
 }
@@ -155,6 +174,20 @@ $TeklaColumnMap = @{
 # Source headers used to derive the Seq / Release values for the sheet NAME.
 $SeqHeader     = "Seq"
 $ReleaseHeader = "Release #"
+
+# Headers that drive the per-piece explosion. "Instance" is SYNTHETIC (added by
+# Expand-RowsByQty, not present in the file), so source-header validation checks
+# every $TeklaColumnMap key EXCEPT it, plus the Qty column that gets exploded.
+$QtyHeader         = "Qty"           # exploded into one row per piece; not uploaded
+$InstanceField     = "Instance"      # synthetic per-piece counter
+$MainMarkHeader    = "Main Mk"       # with Piece Mk: the combination Instance numbers
+$PieceMarkHeader   = "Piece Mk"
+$WeightEachHeader  = "Weight Each"   # per-piece weight; uploaded as "Weight"
+$TotalWeightHeader = "Weight"        # row total (Qty x each); VALIDATION ONLY
+
+$TeklaSourceRequired = @{}
+foreach ($h in $TeklaColumnMap.Keys) { if ($h -ne $InstanceField) { $TeklaSourceRequired[$h] = $TeklaColumnMap[$h] } }
+$TeklaSourceRequired[$QtyHeader] = $QtyHeader
 
 # ----------------------------- VALUE TRANSFORMS ------------------------------
 # Per-column value fixers (source header -> scriptblock). A transform may return
@@ -171,10 +204,10 @@ $TeklaValueTransforms = @{
         elseif ($t -eq '0' -or $t -eq 'FALSE' -or $t -eq 'N' -or $t -eq 'NO')  { $false }
         else   { $v }
     }
-    # The Tekla CSV appends "#" to Weight (e.g. "14.802083#"); strip it so the
-    # value lands as a number. (The .xlsx already exports a clean number, so this
-    # is a no-op there.)
-    "Weight" = { param($v) (([string]$v) -replace '#', '').Trim() }
+    # The Tekla CSV appends "#" to weight fields (e.g. "14.802083#"); strip it so
+    # the value lands as a number. (The .xlsx already exports a clean number, so
+    # this is a no-op there.)
+    "Weight Each" = { param($v) (([string]$v) -replace '#', '').Trim() }
 }
 # =============================================================================
 
@@ -242,6 +275,13 @@ function Set-ApiToken {
 # ============================== SMARTSHEET API ===============================
 $script:Headers = $null
 
+# When TRUE, Invoke-SS treats a 404 ("Not Found") as a TRANSIENT, retryable error
+# instead of a fatal one. We flip this on ONLY while operating on a sheet we just
+# copied (which is eventually consistent and can flicker 404 for a few seconds);
+# everywhere else a 404 stays fatal so a genuine misconfig (wrong/!shared folder
+# id) still fails fast.
+$script:RetryNotFound = $false
+
 function Write-ApiLog {
     param([string]$Text)
     try {
@@ -269,6 +309,10 @@ function ConvertTo-SSJson {
 # Prefer Smartsheet's Retry-After header; else bounded exponential backoff. Cap 300s.
 function Get-RetryDelaySeconds {
     param([int]$Status, $Response, [int]$Try)
+    # A 404 we choose to retry is post-copy eventual-consistency flicker, which
+    # clears in a second or two - retry FAST (2s, 4s, 6s...) rather than the
+    # heavier 5xx/429 backoff below.
+    if ($Status -eq 404) { return [math]::Min(2 * $Try, 8) }
     $retryAfter = $null
     if ($Response) {
         try { $retryAfter = $Response.Headers['Retry-After'] } catch { $retryAfter = $null }
@@ -327,10 +371,12 @@ function Invoke-SS {
             Write-ApiLog ("<-- {0} ERR  {1} {2}  ({3} ms)  body: {4}" -f $status, $Method, $Url, $ms, $oneLine)
 
             if ($try -ge $MaxTries) { Write-ApiLog ("    giving up after {0} try/tries" -f $try); throw }
-            if ($status -eq 429 -or $status -ge 500) {
+            $retry404 = ($status -eq 404 -and $script:RetryNotFound)
+            if ($status -eq 429 -or $status -ge 500 -or $retry404) {
                 $delay = Get-RetryDelaySeconds -Status $status -Response $_.Exception.Response -Try $try
-                if ($status -eq 429) { Write-ApiLog ("    429 rate-limited; sleeping {0}s before retry" -f $delay) }
-                else                 { Write-ApiLog ("    5xx server error; sleeping {0}s before retry" -f $delay) }
+                if     ($status -eq 429) { Write-ApiLog ("    429 rate-limited; sleeping {0}s before retry" -f $delay) }
+                elseif ($retry404)       { Write-ApiLog ("    404 on a just-copied sheet (eventual consistency); sleeping {0}s before retry" -f $delay) }
+                else                     { Write-ApiLog ("    5xx server error; sleeping {0}s before retry" -f $delay) }
                 Start-Sleep -Seconds $delay
             } else {
                 Write-ApiLog "    non-retryable; throwing"; throw
@@ -537,33 +583,61 @@ function Set-SheetSummary {
     & $Log ("  Updated {0} sheet-summary field(s) ({1})." -f $updates.Count, (($ValuesByTitle.Keys | Sort-Object) -join ", "))
 }
 
-# A sheet copy can be ASYNCHRONOUS: an immediate GET can briefly 404. Poll until
-# the sheet answers, or time out. (404 is NOT retried inside Invoke-SS.)
+# A sheet copy is ASYNCHRONOUS and EVENTUALLY CONSISTENT: not only can the first
+# GET 404, but the sheet can answer one call and then 404 the NEXT for a few more
+# seconds (different backend node). So we don't just wait for the FIRST success -
+# we wait until the sheet answers $NeedConsecutive times IN A ROW, which closes
+# the flicker window before the load steps (resolve/clear/add) run against it.
+# (Belt-and-suspenders with Invoke-SS's $script:RetryNotFound 404-retry.)
 # URL NOTE: wrap the id as $($SheetId) before "?" - PS treats "?" as a legal
 # variable-name char, so "$SheetId?page=1" expands to EMPTY -> a permanent 404.
 function Wait-SheetReady {
-    param([long]$SheetId, [string]$Name, [scriptblock]$Log, [int]$TimeoutSec = 300)
+    param([long]$SheetId, [string]$Name, [scriptblock]$Log, [int]$TimeoutSec = 300, [int]$NeedConsecutive = 2)
     $start    = Get-Date
     $deadline = $start.AddSeconds($TimeoutSec)
-    $delay    = 3
+    $delay    = 2
+    $okStreak = 0
     while ($true) {
         try {
             Invoke-SS -Method Get -Url "https://api.smartsheet.com/2.0/sheets/$($SheetId)?page=1&pageSize=1" -MaxTries 1 | Out-Null
-            $elapsed = [int]((Get-Date) - $start).TotalSeconds
-            if ($elapsed -gt 0) { & $Log "  '$Name' ready after $elapsed s." }
-            return
+            $okStreak++
+            if ($okStreak -ge $NeedConsecutive) {
+                $elapsed = [int]((Get-Date) - $start).TotalSeconds
+                if ($elapsed -gt 0) { & $Log "  '$Name' ready after $elapsed s." }
+                return
+            }
+            # Got one good read; pause briefly and confirm it stays available.
+            Start-Sleep -Seconds 1
         } catch {
+            $okStreak = 0   # a 404 mid-streak means it's still flickering; start over
             $status = 0
             if ($_.Exception.Response) { try { $status = [int]$_.Exception.Response.StatusCode } catch { $status = 0 } }
             if ($status -ne 404) { throw }
             if ((Get-Date) -ge $deadline) {
-                throw "Sheet '$Name' (id $SheetId) was still not available after $TimeoutSec s (post-copy provisioning)."
+                throw "Sheet '$Name' (id $SheetId) was still not consistently available after $TimeoutSec s (post-copy provisioning)."
             }
             $elapsed = [int]((Get-Date) - $start).TotalSeconds
             & $Log "  Waiting for '$Name' to finish provisioning... ($elapsed s)"
             Start-Sleep -Seconds $delay
             if ($delay -lt 10) { $delay += 1 }
         }
+    }
+}
+
+# Best-effort DELETE of a sheet. Used to remove a partial sheet before re-trying
+# its release (so retries start clean and no orphan accumulates). Returns $true if
+# the sheet is gone. A 404 here means it's already gone -> also success.
+function Remove-SheetSafe {
+    param([long]$SheetId, [scriptblock]$Log)
+    try {
+        Invoke-SS -Method Delete -Url "https://api.smartsheet.com/2.0/sheets/$SheetId" | Out-Null
+        return $true
+    } catch {
+        $status = 0
+        if ($_.Exception.Response) { try { $status = [int]$_.Exception.Response.StatusCode } catch { $status = 0 } }
+        if ($status -eq 404) { return $true }
+        Write-ApiLog ("    Remove-SheetSafe FAILED for sheet id {0}: {1}" -f $SheetId, $_)
+        return $false
     }
 }
 
@@ -770,6 +844,100 @@ function Assert-SeqRelPresent {
     }
 }
 
+# Parse a Tekla weight cell to a number. The CSV variant appends "#"; strip it.
+# Returns $null if the cell is blank or not numeric.
+function ConvertTo-WeightNumber {
+    param($Value)
+    $s = (([string]$Value) -replace '#', '').Trim()
+    if ($s -eq '') { return $null }
+    $d = 0.0
+    $ok = [double]::TryParse($s, [System.Globalization.NumberStyles]::Float,
+                             [System.Globalization.CultureInfo]::InvariantCulture, [ref]$d)
+    if ($ok) { return $d }
+    return $null
+}
+
+# Every row must carry a positive WHOLE-NUMBER Qty - it drives the per-piece row
+# explosion. If the file also carries the TOTAL weight column, cross-check
+# Qty x "Weight Each" against it on every row (small tolerance for Tekla's own
+# rounding) so a stale or hand-edited export fails loudly BEFORE anything is
+# created in Smartsheet. The total column itself is never uploaded.
+function Assert-QtyAndWeight {
+    param($Records, [scriptblock]$Log)
+    $rows = @($Records)
+    $hasTotal = (@($rows[0].PSObject.Properties.Name) -contains $TotalWeightHeader)
+    if (-not $hasTotal) {
+        & $Log "  NOTE: file has no '$TotalWeightHeader' (total) column - weight cross-check skipped."
+    }
+
+    $badQty   = New-Object System.Collections.Generic.List[string]
+    $badWt    = New-Object System.Collections.Generic.List[string]
+    $nBadQty  = 0
+    $nBadWt   = 0
+    $sumEach  = 0.0   # file-wide Qty x each
+    $sumTotal = 0.0   # file-wide stated totals
+    $fileRow  = 1     # header is row 1; data starts on row 2
+    foreach ($rec in $rows) {
+        $fileRow++
+        $qtyRaw = ([string]$rec.$QtyHeader).Trim()
+        $qty = 0
+        if (-not [int]::TryParse($qtyRaw, [ref]$qty) -or $qty -lt 1) {
+            $nBadQty++
+            if ($badQty.Count -lt 5) { [void]$badQty.Add("file row ${fileRow}: Qty='$qtyRaw'") }
+            continue
+        }
+        if (-not $hasTotal) { continue }
+        $each  = ConvertTo-WeightNumber $rec.$WeightEachHeader
+        $total = ConvertTo-WeightNumber $rec.$TotalWeightHeader
+        if (($null -eq $each) -or ($null -eq $total)) {
+            $nBadWt++
+            if ($badWt.Count -lt 5) { [void]$badWt.Add("file row ${fileRow}: '$WeightEachHeader'='$($rec.$WeightEachHeader)' / '$TotalWeightHeader'='$($rec.$TotalWeightHeader)' (not numeric)") }
+            continue
+        }
+        $sumEach  += ($qty * $each)
+        $sumTotal += $total
+        $tol = [math]::Max(0.05, [math]::Abs($total) * 0.001)
+        if ([math]::Abs(($qty * $each) - $total) -gt $tol) {
+            $nBadWt++
+            if ($badWt.Count -lt 5) { [void]$badWt.Add(("file row {0}: Qty {1} x {2} = {3:0.###} but '{4}' says {5:0.###}" -f $fileRow, $qty, $each, ($qty * $each), $TotalWeightHeader, $total)) }
+        }
+    }
+
+    if ($nBadQty -gt 0) {
+        throw "$nBadQty of $($rows.Count) data row(s) do not have a positive whole-number '$QtyHeader' (e.g. $($badQty -join '; ')). Every row needs one so it can be split into per-piece rows. Fix the export and re-run."
+    }
+    if ($nBadWt -gt 0) {
+        throw "$nBadWt of $($rows.Count) data row(s) FAILED the weight cross-check (Qty x '$WeightEachHeader' should equal '$TotalWeightHeader'). First mismatches: $($badWt -join '; '). The export looks inconsistent - re-export from Tekla and re-run. Nothing was created in Smartsheet."
+    }
+    if ($hasTotal) {
+        & $Log ("  Weight check OK: Qty x each = {0:0.##} matches stated totals = {1:0.##} on all {2} row(s)." -f $sumEach, $sumTotal, $rows.Count)
+    }
+}
+
+# Explode each source row into one row PER PIECE: a row with Qty 4 becomes 4
+# rows, each carrying a synthetic "Instance" number so every physical piece of a
+# Main Mk + Piece Mk combination is uniquely identifiable. Numbering runs per
+# (Main Mk, Piece Mk) across the WHOLE file, so a combination split over several
+# source rows keeps counting (1,2,3,4...) instead of restarting at 1.
+function Expand-RowsByQty {
+    param($Records)
+    $counters = @{}
+    $out = New-Object System.Collections.Generic.List[object]
+    foreach ($rec in @($Records)) {
+        $qty = [int](([string]$rec.$QtyHeader).Trim())   # validated by Assert-QtyAndWeight
+        $key = (([string]$rec.$MainMarkHeader).Trim().ToLowerInvariant()) + '||' + (([string]$rec.$PieceMarkHeader).Trim().ToLowerInvariant())
+        if (-not $counters.ContainsKey($key)) { $counters[$key] = 0 }
+        for ($i = 1; $i -le $qty; $i++) {
+            $counters[$key]++
+            $obj = [ordered]@{}
+            foreach ($p in $rec.PSObject.Properties) { $obj[$p.Name] = $p.Value }
+            $obj[$InstanceField] = [string]$counters[$key]
+            [void]$out.Add([pscustomobject]$obj)
+        }
+    }
+    return $out
+}
+
 # Split records into one group per UNIQUE (Seq, Release #) pair, preserving the
 # order each pair is first seen. Each group becomes its own release sheet.
 function Group-BySeqRel {
@@ -794,13 +962,48 @@ function Group-BySeqRel {
 
 
 # =============================== ORCHESTRATION ===============================
+# Build ONE release sheet for a single Seq/Rel group: copy the template, load the
+# group's rows, stamp the Job # summary. Returns a result hashtable instead of
+# throwing, so the caller can decide whether to clean up + retry. The new sheet's
+# id is always returned (even on failure) so a partial copy can be removed.
+function Invoke-ReleaseGroup {
+    param([string]$Job, $Group, [string]$BaseName, [long]$JobFolderId, [bool]$DryRun, [scriptblock]$Log)
+    $sheetId = $null
+    try {
+        $sheetId = Copy-TemplateSheet -DestFolderId $JobFolderId -NewName $BaseName -Log $Log
+        $url = $script:LastReleaseUrl
+
+        if ($DryRun) {
+            & $Log ("  DRY RUN: {0} data row(s) would load." -f $Group.Rows.Count)
+            try { Rename-Sheet -SheetId $sheetId -NewName (New-SuffixedName $BaseName $DryRunSuffix) } catch { }
+            return @{ Ok = $true; SheetId = $sheetId; Created = 0; Url = $url }
+        }
+
+        Wait-SheetReady -SheetId $sheetId -Name $BaseName -Log $Log
+        $idMap = Resolve-ColumnMap -SheetId $sheetId -TitleMap $TeklaColumnMap -SheetName $BaseName -Log $Log
+        Clear-Sheet -SheetId $sheetId -Log $Log
+        $result = Add-Rows -SheetId $sheetId -Records $Group.Rows -Map $idMap -Log $Log -Transforms $TeklaValueTransforms
+
+        # Stamp the Job # summary field. Sequence(s)/Release(s) are formula fields
+        # that derive themselves from this sheet's single Seq/Release.
+        & $Log "  Updating sheet-summary (Job #)..."
+        Set-SheetSummary -SheetId $sheetId -ValuesByTitle @{ $SummaryJobField = $Job } -Log $Log
+
+        & $Log ("  Loaded {0} row(s) into '{1}'." -f $result.Created, $BaseName)
+        return @{ Ok = $true; SheetId = $sheetId; Created = $result.Created; Url = $url }
+    } catch {
+        return @{ Ok = $false; SheetId = $sheetId; Error = "$_" }
+    }
+}
+
 # Loads the Tekla file, SPLIT into one release sheet per unique Seq+Release pair
 # (e.g. one sequence with two releases -> two sheets). Each sheet is built
-# independently and guarded: a failure on one marks THAT sheet incomplete and is
-# reported, while the others still load. The run as a whole fails (throws) if ANY
-# sheet failed, so a partial result is never silently reported as success.
+# independently; any that fail are AUTO-RETRIED from a clean slate (a just-copied
+# sheet is eventually consistent and can transiently 404 - see $MaxReleaseRetries).
+# The run as a whole fails (throws) only if a release is STILL failing after all
+# retries, so a partial result is never silently reported as success.
 function Invoke-Release {
-    param([string]$Job, [string]$TeklaFile, [bool]$DryRun, [scriptblock]$Log)
+    param([string]$Job, [string]$TeklaFile, [bool]$DryRun, [bool]$SkipExisting, [scriptblock]$Log)
 
     $script:LastReleaseUrl = $null
     Write-ApiLog ("==================== RUN START: Job '{0}'  (v{1}, {2}, DryRun={3}, config={4}) ====================" -f $Job, $ScriptVersion, $EnvironmentName, $DryRun, $ConfigSource)
@@ -813,12 +1016,18 @@ function Invoke-Release {
     # file fails here and leaves no orphan sheet behind.
     & $Log "Reading + checking Tekla file..."
     $teklaRows = Read-DataFile -Path $TeklaFile -HeaderRow $TeklaHeaderRow
-    Assert-SourceData -Records $teklaRows -Map $TeklaColumnMap -FileLabel "Tekla file"
+    Assert-SourceData -Records $teklaRows -Map $TeklaSourceRequired -FileLabel "Tekla file"
     Assert-SeqRelPresent -Records $teklaRows -SeqHeader $SeqHeader -RelHeader $ReleaseHeader
+    Assert-QtyAndWeight -Records $teklaRows -Log $Log
     & $Log ("  Tekla file OK: {0} data row(s)." -f @($teklaRows).Count)
 
+    # One row PER PIECE: explode Qty and stamp each piece's Instance number.
+    $pieceRows = @(Expand-RowsByQty -Records $teklaRows)
+    & $Log ("  Split {0} source row(s) into {1} per-piece row(s) (one per Qty)." -f @($teklaRows).Count, $pieceRows.Count)
+    Write-ApiLog ("    Explode: {0} source rows -> {1} piece rows." -f @($teklaRows).Count, $pieceRows.Count)
+
     # Split into one sheet per unique Seq+Release pair (they live IN the file).
-    $groups = @(Group-BySeqRel -Records $teklaRows -SeqHeader $SeqHeader -RelHeader $ReleaseHeader)
+    $groups = @(Group-BySeqRel -Records $pieceRows -SeqHeader $SeqHeader -RelHeader $ReleaseHeader)
     & $Log ("File contains {0} unique Sequence/Release combination(s) -> {0} release sheet(s):" -f $groups.Count)
     foreach ($g in $groups) { & $Log ("    - Seq {0} Rel {1}  ({2} row(s))" -f $g.Seq, $g.Rel, $g.Rows.Count) }
     Write-ApiLog ("    Split: {0} Seq/Rel group(s)." -f $groups.Count)
@@ -826,77 +1035,119 @@ function Invoke-Release {
     # Ensure the Job # folder exists (create if missing); releases land inside it.
     $jobFolderId = Get-OrCreateJobFolder -JobName $Job -Log $Log
 
-    # Existing sheet names in the Job folder, so we don't create a duplicate. We
-    # ALSO reserve each name we create this run so two groups can't collide.
+    # Existing sheet names in the Job folder, so we don't create a duplicate. Also
+    # reserve each name we assign this run so two groups can't collide.
+    $existingNames = @(Get-JobSheetNames -FolderId $jobFolderId -Log $Log)
+    $existingLower = @{}
+    foreach ($n in $existingNames) { if ($n) { $existingLower[$n.ToLowerInvariant()] = $true } }
     $taken = New-Object System.Collections.Generic.List[string]
-    foreach ($n in @(Get-JobSheetNames -FolderId $jobFolderId -Log $Log)) { [void]$taken.Add($n) }
+    foreach ($n in $existingNames) { [void]$taken.Add($n) }
 
-    $succeeded = New-Object System.Collections.Generic.List[string]
-    $failed    = New-Object System.Collections.Generic.List[string]
-    $lastGoodUrl = $null
+    if ($SkipExisting) { & $Log "Re-run mode ON: releases that already have a sheet in this Job folder are SKIPPED (not duplicated)." }
 
+    # Assign each group its final sheet name once, up front. In re-run mode, a
+    # group whose (clean) name already exists is SKIPPED rather than duplicated;
+    # otherwise a name clash is disambiguated with a -1/-2 suffix.
+    $work    = New-Object System.Collections.Generic.List[object]
+    $skipped = New-Object System.Collections.Generic.List[string]
     foreach ($g in $groups) {
-        # MUST reset per group: otherwise a copy failure here would fall into the
-        # catch holding the PREVIOUS group's id and mark that good sheet incomplete.
-        $sheetId  = $null
         $baseName = New-SuffixedName "$Job Seq $($g.Seq) Rel $($g.Rel)" ""
+        if ($SkipExisting -and $existingLower.ContainsKey($baseName.ToLowerInvariant())) {
+            & $Log "  Skipping '$baseName' (already exists)."
+            Write-ApiLog ("    Re-run: skip '{0}' (already exists)." -f $baseName)
+            [void]$skipped.Add($baseName)
+            continue
+        }
         $uniqueName = Get-UniqueName -BaseName $baseName -Existing $taken.ToArray()
         if ($uniqueName -ne $baseName) {
             & $Log "A release sheet named '$baseName' already exists; using '$uniqueName' instead."
             Write-ApiLog ("    Dedup: '{0}' taken -> using '{1}'." -f $baseName, $uniqueName)
             $baseName = $uniqueName
         }
-        [void]$taken.Add($baseName)   # reserve before creating so the next group can't reuse it
+        [void]$taken.Add($baseName)
+        [void]$work.Add(@{ Group = $g; Name = $baseName })
+    }
+    if ($skipped.Count -gt 0) { & $Log ("Re-run: {0} existing release(s) skipped; {1} to build." -f $skipped.Count, $work.Count) }
+    if ($work.Count -eq 0) {
+        & $Log "Nothing to build - every release in the file already exists in the Job folder."
+        return
+    }
 
-        & $Log ""
-        & $Log "--- Release '$baseName'  ($($g.Rows.Count) row(s)) ---"
-        try {
-            $sheetId = Copy-TemplateSheet -DestFolderId $jobFolderId -NewName $baseName -Log $Log
+    $succeeded   = New-Object System.Collections.Generic.List[string]
+    $lastGoodUrl = $null
+    $pending     = $work          # items still to do (all, then only failures)
 
-            if ($DryRun) {
-                & $Log ("  DRY RUN: {0} data row(s) would load." -f $g.Rows.Count)
-                try { Rename-Sheet -SheetId $sheetId -NewName (New-SuffixedName $baseName $DryRunSuffix) } catch { }
-                [void]$succeeded.Add($baseName)
-                if ($script:LastReleaseUrl) { $lastGoodUrl = $script:LastReleaseUrl }
-                continue
+    # From here on we only touch freshly-copied sheets, which are eventually
+    # consistent - tell Invoke-SS to treat their transient 404s as retryable.
+    $script:RetryNotFound = $true
+    try {
+        for ($pass = 0; $pass -le $MaxReleaseRetries; $pass++) {
+            if ($pending.Count -eq 0) { break }
+            if ($pass -gt 0) {
+                & $Log ""
+                & $Log ("=== Retry pass {0} of {1}: re-attempting {2} release(s) that failed, after a {3}s settle... ===" -f $pass, $MaxReleaseRetries, $pending.Count, $RetrySettleSeconds)
+                Write-ApiLog ("    Retry pass {0}: {1} pending." -f $pass, $pending.Count)
+                Start-Sleep -Seconds $RetrySettleSeconds
             }
+            $isFinalPass = ($pass -ge $MaxReleaseRetries)
+            $stillPending = New-Object System.Collections.Generic.List[object]
 
-            Wait-SheetReady -SheetId $sheetId -Name $baseName -Log $Log
-            $idMap = Resolve-ColumnMap -SheetId $sheetId -TitleMap $TeklaColumnMap -SheetName $baseName -Log $Log
-            Clear-Sheet -SheetId $sheetId -Log $Log
-            $result = Add-Rows -SheetId $sheetId -Records $g.Rows -Map $idMap -Log $Log -Transforms $TeklaValueTransforms
+            foreach ($item in $pending) {
+                $g = $item.Group; $name = $item.Name
+                & $Log ""
+                $tag = if ($pass -gt 0) { "  [retry $pass]" } else { "" }
+                & $Log "--- Release '$name'  ($($g.Rows.Count) row(s))$tag ---"
 
-            # Stamp the Job # summary field. Sequence(s)/Release(s) are formula
-            # fields that derive themselves from this sheet's single Seq/Release.
-            & $Log "  Updating sheet-summary (Job #)..."
-            Set-SheetSummary -SheetId $sheetId -ValuesByTitle @{ $SummaryJobField = $Job } -Log $Log
+                $res = Invoke-ReleaseGroup -Job $Job -Group $g -BaseName $name -JobFolderId $jobFolderId -DryRun $DryRun -Log $Log
 
-            & $Log ("  Loaded {0} row(s) into '{1}'." -f $result.Created, $baseName)
-            [void]$succeeded.Add($baseName)
-            if ($script:LastReleaseUrl) { $lastGoodUrl = $script:LastReleaseUrl }
-        } catch {
-            $errText = "$_"
-            if ($sheetId) {
-                $mark = Set-SheetIncomplete -SheetId $sheetId -BaseName $baseName -Log $Log
-                $errText = "$errText  >> $mark"
+                if ($res.Ok) {
+                    [void]$succeeded.Add($name)
+                    if ($res.Url) { $lastGoodUrl = $res.Url }
+                    continue
+                }
+
+                & $Log "  ERROR on '$name': $($res.Error)"
+                Write-ApiLog ("    Group FAILED '{0}': {1}" -f $name, $res.Error)
+                if (-not $isFinalPass) {
+                    # Will retry: delete the partial sheet so the next attempt is
+                    # clean and no orphan piles up. If we can't delete it, fall back
+                    # to marking it incomplete so it's never mistaken for good.
+                    if ($res.SheetId) {
+                        if (Remove-SheetSafe -SheetId $res.SheetId -Log $Log) {
+                            & $Log "  Removed the partial sheet; will retry it."
+                        } else {
+                            $mark = Set-SheetIncomplete -SheetId $res.SheetId -BaseName $name -Log $Log
+                            & $Log "  Could not remove the partial sheet. $mark"
+                        }
+                    }
+                } else {
+                    # Out of retries: leave a clearly-marked artifact for inspection.
+                    if ($res.SheetId) {
+                        $mark = Set-SheetIncomplete -SheetId $res.SheetId -BaseName $name -Log $Log
+                        & $Log "  $mark"
+                    }
+                }
+                [void]$stillPending.Add($item)
             }
-            & $Log "  ERROR on '$baseName': $errText"
-            Write-ApiLog ("    Group FAILED '{0}': {1}" -f $baseName, $errText)
-            [void]$failed.Add($baseName)
+            $pending = $stillPending
         }
+    } finally {
+        $script:RetryNotFound = $false
     }
 
     # Point "Open release" at the last sheet we successfully created (best effort).
     $script:LastReleaseUrl = $lastGoodUrl
 
     # ---- Final report ----
+    $failedNames = @($pending | ForEach-Object { $_.Name })
     & $Log ""
-    & $Log ("=== Summary: {0} of {1} release sheet(s) OK. ===" -f $succeeded.Count, $groups.Count)
-    if ($succeeded.Count -gt 0) { & $Log ("  OK:     " + ($succeeded -join "  |  ")) }
-    if ($failed.Count -gt 0)    { & $Log ("  FAILED: " + ($failed -join "  |  ")) }
+    & $Log ("=== Summary: {0} of {1} release sheet(s) OK. ===" -f $succeeded.Count, $work.Count)
+    if ($succeeded.Count -gt 0)   { & $Log ("  OK:      " + ($succeeded -join "  |  ")) }
+    if ($failedNames.Count -gt 0) { & $Log ("  FAILED:  " + ($failedNames -join "  |  ")) }
+    if ($skipped.Count -gt 0)     { & $Log ("  SKIPPED ({0}, already existed): {1}" -f $skipped.Count, ($skipped -join "  |  ")) }
 
-    if ($failed.Count -gt 0) {
-        throw ("{0} of {1} release sheet(s) FAILED: {2}. The failed sheet(s) were marked INCOMPLETE (or flagged above if even that could not be done) - delete them and re-run. The {3} that succeeded are correct and complete." -f $failed.Count, $groups.Count, ($failed -join ", "), $succeeded.Count)
+    if ($failedNames.Count -gt 0) {
+        throw ("{0} of {1} release sheet(s) still FAILED after {2} retr{3}: {4}. Their partial sheets were removed (or marked INCOMPLETE if removal failed) - just re-run to rebuild only those. The {5} that succeeded are correct and complete." -f $failedNames.Count, $work.Count, $MaxReleaseRetries, $(if ($MaxReleaseRetries -eq 1) { 'y' } else { 'ies' }), ($failedNames -join ", "), $succeeded.Count)
     }
     if ($DryRun) { & $Log "=== DRY RUN complete. No data loaded. Review/delete the '(DRY RUN)' sheet(s). ===" }
     else         { & $Log "=== DONE: all $($succeeded.Count) release sheet(s) are ready. ===" }
@@ -910,7 +1161,7 @@ Add-Type -AssemblyName System.Drawing
 
 $form = New-Object Windows.Forms.Form
 $form.Text = "Create Expediting Release  [$EnvironmentName]  v$ScriptVersion"
-$form.Size = New-Object Drawing.Size(560, 540)
+$form.Size = New-Object Drawing.Size(560, 580)
 $form.StartPosition = "CenterScreen"
 $form.FormBorderStyle = "FixedDialog"
 $form.MaximizeBox = $false
@@ -937,15 +1188,33 @@ $form.Controls.Add($btnTekla)
 
 $cbDryRun = New-Object Windows.Forms.CheckBox
 $cbDryRun.Text = "Test copy only - creates a DRY RUN sheet in Smartsheet, loads NO data"
-$cbDryRun.Location = "20,95"; $cbDryRun.AutoSize = $true
+$cbDryRun.Location = "20,90"; $cbDryRun.AutoSize = $true
 $form.Controls.Add($cbDryRun)
 
+# Re-run mode: skip Seq/Rel releases that already have a sheet in the Job folder
+# (instead of creating a "-1" duplicate). Lets you re-run the same file to fill in
+# only the releases that are missing.
+$cbRerun = New-Object Windows.Forms.CheckBox
+$cbRerun.Text = "Re-run: skip releases that already exist in this Job folder"
+$cbRerun.Location = "20,112"; $cbRerun.AutoSize = $true
+$form.Controls.Add($cbRerun)
+
 $btnRun = New-Object Windows.Forms.Button
-$btnRun.Text = "Create Release"; $btnRun.Location = "20,122"; $btnRun.Width = 500; $btnRun.Height = 34
+$btnRun.Text = "Create Release"; $btnRun.Location = "20,140"; $btnRun.Width = 380; $btnRun.Height = 34
 $form.Controls.Add($btnRun)
 
+# Live elapsed-time readout. Updates as the on-screen log advances (the $Logger's
+# DoEvents pump drives the timer ticks during a run).
+$lblTimer = New-Object Windows.Forms.Label
+$lblTimer.Location = "410,140"; $lblTimer.Size = New-Object Drawing.Size(110, 34)
+$lblTimer.TextAlign = "MiddleCenter"
+$lblTimer.BorderStyle = "FixedSingle"
+$lblTimer.Font = New-Object Drawing.Font("Consolas", 11, [Drawing.FontStyle]::Bold)
+$lblTimer.Text = "00:00"
+$form.Controls.Add($lblTimer)
+
 $lblStatus = New-Object Windows.Forms.Label
-$lblStatus.Location = "20,165"; $lblStatus.Size = New-Object Drawing.Size(500, 26)
+$lblStatus.Location = "20,184"; $lblStatus.Size = New-Object Drawing.Size(500, 26)
 $lblStatus.TextAlign = "MiddleCenter"
 $lblStatus.Font = New-Object Drawing.Font("Segoe UI", 10, [Drawing.FontStyle]::Bold)
 $lblStatus.BackColor = [Drawing.Color]::Gainsboro
@@ -954,12 +1223,12 @@ $form.Controls.Add($lblStatus)
 
 $logBox = New-Object Windows.Forms.TextBox
 $logBox.Multiline = $true; $logBox.ScrollBars = "Vertical"; $logBox.ReadOnly = $true
-$logBox.Location = "20,197"; $logBox.Size = New-Object Drawing.Size(500, 250)
+$logBox.Location = "20,216"; $logBox.Size = New-Object Drawing.Size(500, 250)
 $logBox.Font = New-Object Drawing.Font("Consolas", 9)
 $form.Controls.Add($logBox)
 
 $btnOpen = New-Object Windows.Forms.Button
-$btnOpen.Text = "Open release in Smartsheet"; $btnOpen.Location = "20,457"; $btnOpen.Width = 220; $btnOpen.Height = 28
+$btnOpen.Text = "Open release in Smartsheet"; $btnOpen.Location = "20,476"; $btnOpen.Width = 220; $btnOpen.Height = 28
 $btnOpen.Enabled = $false
 $btnOpen.Add_Click({
     if ($script:LastReleaseUrl) {
@@ -970,7 +1239,7 @@ $btnOpen.Add_Click({
 $form.Controls.Add($btnOpen)
 
 $btnLog = New-Object Windows.Forms.Button
-$btnLog.Text = "Open Log Folder"; $btnLog.Location = "248,457"; $btnLog.Width = 150; $btnLog.Height = 28
+$btnLog.Text = "Open Log Folder"; $btnLog.Location = "248,476"; $btnLog.Width = 150; $btnLog.Height = 28
 $btnLog.Add_Click({
     try { Start-Process -FilePath explorer.exe -ArgumentList "`"$AppDataDir`"" }
     catch { [System.Windows.Forms.MessageBox]::Show("Log folder:`r`n$AppDataDir", "Open Log Folder") | Out-Null }
@@ -978,7 +1247,7 @@ $btnLog.Add_Click({
 $form.Controls.Add($btnLog)
 
 $btnCopy = New-Object Windows.Forms.Button
-$btnCopy.Text = "Copy Log"; $btnCopy.Location = "404,457"; $btnCopy.Width = 116; $btnCopy.Height = 28
+$btnCopy.Text = "Copy Log"; $btnCopy.Location = "404,476"; $btnCopy.Width = 116; $btnCopy.Height = 28
 $btnCopy.Add_Click({
     if ($logBox.Text) { try { [System.Windows.Forms.Clipboard]::SetText($logBox.Text) } catch { } }
 })
@@ -993,6 +1262,20 @@ function Set-Status($text, $color) {
     $lblStatus.BackColor = $color
     $lblStatus.Refresh()
 }
+
+# Elapsed-time clock. A WinForms timer fires its Tick via the message loop, which
+# the $Logger's DoEvents() (called on every log line) pumps during a run - so the
+# readout advances roughly each log line. $RunStart is set when a run begins.
+$script:RunStart = $null
+$runTimer = New-Object Windows.Forms.Timer
+$runTimer.Interval = 1000
+function Update-Elapsed {
+    if ($script:RunStart) {
+        $el = (Get-Date) - $script:RunStart
+        $lblTimer.Text = ("{0:00}:{1:00}" -f [int][math]::Floor($el.TotalMinutes), $el.Seconds)
+    }
+}
+$runTimer.Add_Tick({ Update-Elapsed })
 
 # Remember the last-browsed folder across launches.
 $LastDirPath = Join-Path $AppDataDir "lastdir.txt"
@@ -1018,6 +1301,7 @@ $btnTekla.Add_Click({ & $pick $tbTekla $dataFilter })
 $btnRun.Add_Click({
     $logBox.Clear()
     $btnOpen.Enabled = $false
+    $lblTimer.Text = "00:00"
     Set-Status "Working..." ([Drawing.Color]::Khaki)
 
     # --- config sanity (fail before any API call if IDs aren't filled in) ---
@@ -1053,8 +1337,10 @@ $btnRun.Add_Click({
 
     $btnRun.Enabled = $false
     $script:IsRunning = $true
+    $script:RunStart = Get-Date
+    $runTimer.Start()
     try {
-        Invoke-Release -Job $tbJob.Text.Trim() -TeklaFile $tbTekla.Text -DryRun $cbDryRun.Checked -Log $Logger
+        Invoke-Release -Job $tbJob.Text.Trim() -TeklaFile $tbTekla.Text -DryRun $cbDryRun.Checked -SkipExisting $cbRerun.Checked -Log $Logger
         if ($cbDryRun.Checked) {
             Set-Status "DRY RUN OK - no data loaded" ([Drawing.Color]::LightGreen)
         } else {
@@ -1071,6 +1357,8 @@ $btnRun.Add_Click({
             [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
     } finally {
         $script:IsRunning = $false
+        $runTimer.Stop()
+        Update-Elapsed          # stamp the final total
         $btnRun.Enabled = $true
     }
 })
