@@ -91,7 +91,7 @@ if (Test-Path $ConfigPath) {
 }
 
 # Tool version - shown in the window title and run log. Bump on each released change.
-$ScriptVersion = "1.2.1"
+$ScriptVersion = "1.2.2"
 
 # Sheet-SUMMARY field on the copied sheet to stamp with the Job #. (Sequence(s)
 # and Release(s) are FORMULA summary fields that derive themselves from the
@@ -283,6 +283,26 @@ $script:Headers = $null
 # id) still fails fast.
 $script:RetryNotFound = $false
 
+# Set when the user confirms the "cancel run?" prompt (window [X] mid-run). The
+# run can't be killed mid-handler (it executes inside the button click, pumped by
+# DoEvents), so cancellation is COOPERATIVE: Invoke-SS aborts before its next
+# request, the orchestration cleans up the interrupted release, and the GUI then
+# closes the window itself. The flag is cleared briefly to let the CLEANUP API
+# calls (delete/mark the partial sheet) through.
+$script:CancelRequested = $false
+
+# Sleep that stays responsive: pumps the UI message loop each second (so the [X]
+# click and the cancel prompt work even during long retry backoffs) and returns
+# early the moment a cancel is requested.
+function Start-InterruptibleSleep {
+    param([int]$Seconds)
+    for ($s = 0; $s -lt $Seconds; $s++) {
+        if ($script:CancelRequested) { return }
+        Start-Sleep -Seconds 1
+        try { [System.Windows.Forms.Application]::DoEvents() } catch { }
+    }
+}
+
 function Write-ApiLog {
     param([string]$Text)
     try {
@@ -347,6 +367,10 @@ function Invoke-SS {
 
     $try = 0
     while ($true) {
+        if ($script:CancelRequested) {
+            Write-ApiLog ("    CANCELLED by user - aborting before {0} {1}" -f $Method, $Url)
+            throw "Run cancelled by user."
+        }
         $try++
         $reqStart = Get-Date
         Write-ApiLog ("--> [try {0}] {1} {2}  (body {3} bytes)" -f $try, $Method, $Url, $bodyLen)
@@ -378,7 +402,7 @@ function Invoke-SS {
                 if     ($status -eq 429) { Write-ApiLog ("    429 rate-limited; sleeping {0}s before retry" -f $delay) }
                 elseif ($retry404)       { Write-ApiLog ("    404 on a just-copied sheet (eventual consistency); sleeping {0}s before retry" -f $delay) }
                 else                     { Write-ApiLog ("    5xx server error; sleeping {0}s before retry" -f $delay) }
-                Start-Sleep -Seconds $delay
+                Start-InterruptibleSleep -Seconds $delay
             } else {
                 Write-ApiLog "    non-retryable; throwing"; throw
             }
@@ -619,7 +643,7 @@ function Wait-SheetReady {
             }
             $elapsed = [int]((Get-Date) - $start).TotalSeconds
             & $Log "  Waiting for '$Name' to finish provisioning... ($elapsed s)"
-            Start-Sleep -Seconds $delay
+            Start-InterruptibleSleep -Seconds $delay
             if ($delay -lt 10) { $delay += 1 }
         }
     }
@@ -1094,12 +1118,16 @@ function Invoke-Release {
                 & $Log ""
                 & $Log ("=== Retry pass {0} of {1}: re-attempting {2} release(s) that failed, after a {3}s settle... ===" -f $pass, $MaxReleaseRetries, $pending.Count, $RetrySettleSeconds)
                 Write-ApiLog ("    Retry pass {0}: {1} pending." -f $pass, $pending.Count)
-                Start-Sleep -Seconds $RetrySettleSeconds
+                Start-InterruptibleSleep -Seconds $RetrySettleSeconds
             }
             $isFinalPass = ($pass -ge $MaxReleaseRetries)
             $stillPending = New-Object System.Collections.Generic.List[object]
 
             foreach ($item in $pending) {
+                if ($script:CancelRequested) {
+                    Write-ApiLog ("    CANCELLED by user before release '{0}' started." -f $item.Name)
+                    throw "Run CANCELLED by user. $($succeeded.Count) release(s) completed before the cancel and are kept; the remaining release(s) were not started. Re-run the same file with 'Re-run: skip releases that already exist' checked to build the rest."
+                }
                 $g = $item.Group; $name = $item.Name
                 & $Log ""
                 $tag = if ($pass -gt 0) { "  [retry $pass]" } else { "" }
@@ -1115,6 +1143,23 @@ function Invoke-Release {
 
                 & $Log "  ERROR on '$name': $($res.Error)"
                 Write-ApiLog ("    Group FAILED '{0}': {1}" -f $name, $res.Error)
+                if ($script:CancelRequested) {
+                    # The failure above was the cancel itself (Invoke-SS aborted
+                    # mid-build). Clean up this release's partial sheet, then stop
+                    # the whole run. Clear the flag FIRST so the cleanup API calls
+                    # below are allowed through.
+                    $script:CancelRequested = $false
+                    & $Log "  Cancel requested - cleaning up '$name' before stopping..."
+                    if ($res.SheetId) {
+                        if (Remove-SheetSafe -SheetId $res.SheetId -Log $Log) {
+                            & $Log "  Removed the partially-built sheet."
+                        } else {
+                            $mark = Set-SheetIncomplete -SheetId $res.SheetId -BaseName $name -Log $Log
+                            & $Log "  Could not remove the partial sheet. $mark"
+                        }
+                    }
+                    throw "Run CANCELLED by user during release '$name' (its partial sheet was cleaned up). $($succeeded.Count) release(s) completed before the cancel and are kept. Re-run the same file with 'Re-run: skip releases that already exist' checked to build the rest."
+                }
                 if (-not $isFinalPass) {
                     # Will retry: delete the partial sheet so the next attempt is
                     # clean and no orphan piles up. If we can't delete it, fall back
@@ -1344,6 +1389,8 @@ $btnRun.Add_Click({
 
     $btnRun.Enabled = $false
     $script:IsRunning = $true
+    $script:CancelRequested = $false
+    $script:CloseAfterRun   = $false
     $script:RunStart = Get-Date
     $runTimer.Start()
     try {
@@ -1355,33 +1402,55 @@ $btnRun.Add_Click({
         }
         if ($script:LastReleaseUrl) { $btnOpen.Enabled = $true }
     } catch {
-        Set-Status "FAILED - see log for details" ([Drawing.Color]::Salmon)
-        & $Logger "ERROR: $_"
-        [System.Windows.Forms.MessageBox]::Show(
-            "$_",
-            "Release FAILED - do not use the incomplete sheet(s)",
-            [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+        if ($script:CloseAfterRun) {
+            # The user asked to cancel + close; no error popup (it would block the
+            # close they already confirmed). The log/trace keep the details.
+            Set-Status "CANCELLED by user" ([Drawing.Color]::Orange)
+            & $Logger "RUN CANCELLED: $_"
+            Write-ApiLog ("    RUN CANCELLED by user: {0}" -f $_)
+        } else {
+            Set-Status "FAILED - see log for details" ([Drawing.Color]::Salmon)
+            & $Logger "ERROR: $_"
+            [System.Windows.Forms.MessageBox]::Show(
+                "$_",
+                "Release FAILED - do not use the incomplete sheet(s)",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+        }
     } finally {
         $script:IsRunning = $false
         $runTimer.Stop()
         Update-Elapsed          # stamp the final total
         $btnRun.Enabled = $true
+        # IsRunning is now false, so this Close() sails through FormClosing.
+        if ($script:CloseAfterRun) { $form.Close() }
     }
 })
 
-# Guard window-close mid-run: the DoEvents logger lets the [X] fire during a load,
-# which could orphan a half-built sheet that never got marked INCOMPLETE.
-$script:IsRunning = $false
+# Guard window-close mid-run. The run executes INSIDE the button-click handler
+# (pumped by the logger's DoEvents), so the form physically CANNOT close while it
+# is running - the modal loop can't exit until the handler returns. (That is why
+# the old "Close anyway?" Yes did nothing.) Instead, Yes requests a COOPERATIVE
+# cancel: the run aborts at its next API call, cleans up the interrupted
+# release, and the click handler's finally block then closes the window itself.
+$script:IsRunning     = $false
+$script:CloseAfterRun = $false
 $form.Add_FormClosing({
     param($eventSender, $e)
-    if ($script:IsRunning) {
-        $r = [System.Windows.Forms.MessageBox]::Show(
-            "A release is still running. Closing now may leave an unfinished sheet in Smartsheet that is NOT marked incomplete - you would have to find and delete it by hand. Close anyway?",
-            "Release in progress",
-            [System.Windows.Forms.MessageBoxButtons]::YesNo,
-            [System.Windows.Forms.MessageBoxIcon]::Warning)
-        if ($r -ne [System.Windows.Forms.DialogResult]::Yes) { $e.Cancel = $true }
+    if (-not $script:IsRunning) { return }    # idle: close normally
+    $e.Cancel = $true                          # mid-run the form NEVER closes directly
+    if ($script:CloseAfterRun) { return }      # already cancelling; hold on
+    $r = [System.Windows.Forms.MessageBox]::Show(
+        "A release is still running. Stop it and close?`r`n`r`nThe release being built right now will be removed (or marked INCOMPLETE if removal fails); releases already completed are kept. The window will close itself when cleanup finishes.",
+        "Cancel run?",
+        [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        [System.Windows.Forms.MessageBoxIcon]::Warning)
+    if ($r -eq [System.Windows.Forms.DialogResult]::Yes) {
+        $script:CancelRequested = $true
+        $script:CloseAfterRun   = $true
+        Set-Status "CANCELLING - cleaning up, window will close itself..." ([Drawing.Color]::Orange)
+        $logBox.AppendText("*** CANCEL requested - stopping at the next safe point... ***`r`n")
+        Write-ApiLog "    CANCEL requested by user (window close)."
     }
 })
 

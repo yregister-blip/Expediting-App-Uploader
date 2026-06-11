@@ -126,6 +126,12 @@ job runs (handy for large multi-release files). Two checkboxes:
   skipped (their clean name is free), so a re-run rebuilds exactly the missing/failed
   ones. Leave it unchecked for a first load.
 
+Closing the window mid-run asks for confirmation and then **cancels safely**: the run
+stops at its next API call, the release being built at that moment is removed (or
+marked `!! INCOMPLETE !!` if removal fails), releases already completed are kept, and
+the window closes itself when cleanup finishes. Re-run the same file with **Re-run:
+skip releases that already exist** to build the rest.
+
 On first run you'll be prompted once for your Smartsheet API token (stored
 DPAPI-encrypted under `%LOCALAPPDATA%\Qualico\ExpeditingUploader\`). The same folder
 holds the trace log (`Expediting-Uploader-API.log`) — use **Open Log Folder** to find
